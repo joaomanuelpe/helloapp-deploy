@@ -1,0 +1,175 @@
+name: Publicação automática
+
+on:
+  # executa a cada push na main e também permite disparo manual pela aba Actions
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+# Configuração do servidor (vm-atividade-web)
+env:
+  APP_DIR: /home/ubuntu/helloapp        # pasta da aplicação Flask
+  BACKUP_DIR: /home/ubuntu/backups      # pasta onde os backups serão guardados
+  SERVICE_NAME: helloapp.service        # serviço systemd que roda o Gunicorn
+  SSH_USER: ubuntu
+  HEALTH_URL: http://127.0.0.1:8000/    # endereço onde o Gunicorn responde dentro da VM
+  MAX_BACKUPS: 5                        # quantos backups manter (os mais antigos são apagados)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixando o código do repositório
+        uses: actions/checkout@v4
+
+      - name: Preparando a chave SSH
+        run: |
+          echo "${{ secrets.KEY }}" > /tmp/private_key
+          chmod 600 /tmp/private_key
+          # StrictHostKeyChecking: desativa o prompt de fingerprint
+          # UserKnownHostsFile: não salva a chave do servidor
+          echo "SSH_OPTS=-i /tmp/private_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" >> $GITHUB_ENV
+          echo "REMOTE=${SSH_USER}@${{ secrets.HOST }}" >> $GITHUB_ENV
+
+      - name: Backup da versão atual
+        id: backup
+        run: |
+          ssh $SSH_OPTS $REMOTE "bash -s" << EOF
+          set -e
+          sudo mkdir -p ${APP_DIR} ${BACKUP_DIR}
+          sudo chown -R ${SSH_USER}:${SSH_USER} ${APP_DIR} ${BACKUP_DIR}
+          if [ -n "\$(ls -A ${APP_DIR})" ]; then
+            ARQUIVO=${BACKUP_DIR}/app_\$(TZ=America/Sao_Paulo date +%Y%m%d_%H%M%S).tar.gz
+            tar -czf "\$ARQUIVO" --exclude=venv --exclude=__pycache__ -C ${APP_DIR} .
+            echo "Backup criado: \$ARQUIVO"
+          else
+            echo "Pasta da aplicação vazia, nada para salvar (primeiro deploy)."
+          fi
+          # mantém apenas os últimos backups
+          ls -1t ${BACKUP_DIR}/app_*.tar.gz 2>/dev/null | tail -n +$((MAX_BACKUPS + 1)) | xargs -r rm -f
+          echo "Backups disponíveis:"
+          ls -lh ${BACKUP_DIR}
+          EOF
+
+      - name: Removendo a versão antiga (mantém venv e .env)
+        run: |
+          ssh $SSH_OPTS $REMOTE "find ${APP_DIR} -mindepth 1 -maxdepth 1 ! -name venv ! -name .env -exec rm -rf {} +"
+
+      - name: Transferindo os arquivos da aplicação
+        run: |
+          scp $SSH_OPTS -r ${{ github.workspace }}/* $REMOTE:${APP_DIR}
+
+      - name: Instalando as dependências
+        run: |
+          ssh $SSH_OPTS $REMOTE "bash -s" << EOF
+          set -e
+          cd ${APP_DIR}
+          if [ ! -d venv ]; then
+            python3 -m venv venv
+          fi
+          if [ -f requirements.txt ]; then
+            venv/bin/pip install -r requirements.txt
+          else
+            echo "Sem requirements.txt, mantendo as dependências atuais do venv."
+          fi
+          EOF
+
+      - name: Reiniciando o serviço e verificando se a aplicação responde
+        run: |
+          ssh $SSH_OPTS $REMOTE "bash -s" << EOF
+          sudo systemctl restart ${SERVICE_NAME}
+          for i in \$(seq 1 10); do
+            sleep 2
+            CODE=\$(curl -s -o /dev/null -w "%{http_code}" ${HEALTH_URL} || true)
+            echo "Tentativa \$i: HTTP \$CODE"
+            if [ "\$CODE" -ge 200 ] && [ "\$CODE" -lt 500 ]; then
+              echo "Aplicação respondendo normalmente."
+              exit 0
+            fi
+          done
+          echo "A aplicação não respondeu depois do restart. Últimas linhas do log:"
+          sudo journalctl -u ${SERVICE_NAME} -n 20 --no-pager
+          exit 1
+          EOF
+
+      - name: Restaurando o backup (rollback em caso de erro)
+        id: rollback
+        if: failure() && steps.backup.outcome == 'success'
+        run: |
+          ssh $SSH_OPTS $REMOTE "bash -s" << EOF
+          set -e
+          ULTIMO=\$(ls -1t ${BACKUP_DIR}/app_*.tar.gz 2>/dev/null | head -n 1)
+          if [ -z "\$ULTIMO" ]; then
+            echo "Nenhum backup disponível para restaurar."
+            exit 1
+          fi
+          find ${APP_DIR} -mindepth 1 -maxdepth 1 ! -name venv ! -name .env -exec rm -rf {} +
+          tar -xzf "\$ULTIMO" -C ${APP_DIR}
+          if [ -f ${APP_DIR}/requirements.txt ]; then
+            ${APP_DIR}/venv/bin/pip install -r ${APP_DIR}/requirements.txt
+          fi
+          sudo systemctl restart ${SERVICE_NAME}
+          echo "Rollback realizado a partir de \$ULTIMO"
+          EOF
+
+      - name: Notificando no Discord
+        if: always()
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          STATUS: ${{ job.status }}
+          ROLLBACK: ${{ steps.rollback.outcome }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$STATUS" = "success" ]; then
+            TITULO="✅ Deploy realizado com sucesso"
+            COR=3066993
+          elif [ "$STATUS" = "cancelled" ]; then
+            TITULO="⚠️ Deploy cancelado"
+            COR=16776960
+          else
+            TITULO="❌ Falha no deploy"
+            COR=15158332
+          fi
+
+          case "$ROLLBACK" in
+            success) INFO_ROLLBACK="Versão anterior restaurada a partir do backup" ;;
+            failure) INFO_ROLLBACK="Rollback falhou, verificar o servidor manualmente" ;;
+            *)       INFO_ROLLBACK="Não foi necessário" ;;
+          esac
+
+          MENSAGEM=$(printf '%s' "${COMMIT_MSG:-Disparo manual}" | head -n 1)
+
+          jq -n \
+            --arg titulo "$TITULO" \
+            --argjson cor "$COR" \
+            --arg url "$RUN_URL" \
+            --arg repo "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg commit "${GITHUB_SHA::7}" \
+            --arg autor "${{ github.actor }}" \
+            --arg msg "$MENSAGEM" \
+            --arg rollback "$INFO_ROLLBACK" \
+            '{
+              username: "GitHub Actions",
+              embeds: [{
+                title: $titulo,
+                url: $url,
+                color: $cor,
+                fields: [
+                  { name: "Repositório", value: $repo, inline: true },
+                  { name: "Branch", value: $branch, inline: true },
+                  { name: "Commit", value: $commit, inline: true },
+                  { name: "Autor", value: $autor, inline: true },
+                  { name: "Mensagem", value: $msg },
+                  { name: "Rollback", value: $rollback }
+                ]
+              }]
+            }' > payload.json
+
+          curl -sS -X POST -H "Content-Type: application/json" -d @payload.json "$WEBHOOK"
+
+      - name: Apagando a chave privada
+        if: always()
+        run: rm -f /tmp/private_key payload.json

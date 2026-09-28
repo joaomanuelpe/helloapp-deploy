@@ -1,8 +1,11 @@
-from flask import Flask
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import socket
 
 app = Flask(__name__)
+
+# horário em que a aplicação subiu, ou seja, o horário do último deploy
+DEPLOY_EM = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%d/%m/%Y %H:%M")
 
 PAGINA = r"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -255,7 +258,8 @@ PAGINA = r"""<!DOCTYPE html>
 
     <p class="sub">
       Aplicacao Web hospedada na Oracle Cloud Infrastructure<br>
-      servida por Nginx como proxy reverso
+      servida por Nginx como proxy reverso<br>
+      publicada automaticamente via GitHub Actions (CI/CD)
     </p>
 
     <div class="stack">
@@ -264,6 +268,8 @@ PAGINA = r"""<!DOCTYPE html>
       <span class="chip">Gunicorn</span>
       <span class="chip">Flask</span>
       <span class="chip">systemd</span>
+      <span class="chip">GitHub Actions</span>
+      <span class="chip">Discord</span>
     </div>
 
     <button class="botao" id="btn">Passei por aqui</button>
@@ -273,6 +279,7 @@ PAGINA = r"""<!DOCTYPE html>
     <div class="rodape">
       <p class="autor">Atividade TTC III &bull; Joao Manuel</p>
       <p class="servidor">host: __HOST__</p>
+      <p class="servidor">último deploy: __DEPLOY__</p>
     </div>
   </main>
 
@@ -374,6 +381,7 @@ PAGINA = r"""<!DOCTYPE html>
 def hello():
     pagina = PAGINA.replace("__HOST__", socket.gethostname())
     pagina = pagina.replace("__DATA__", datetime.now().strftime("%d/%m/%Y %H:%M"))
+    pagina = pagina.replace("__DEPLOY__", DEPLOY_EM)
     return pagina
 
 
